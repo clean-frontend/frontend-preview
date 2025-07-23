@@ -57,6 +57,10 @@ EXPOSE 3000
 
 ENV PORT=3000
 
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --spider -q http://0.0.0.0:3000/api/health || exit 1
+
+COPY .env.local .env.local
 # server.js is created by next build from the standalone output
 # https://nextjs.org/docs/pages/api-reference/config/next-config-js/output
 ENV HOSTNAME="0.0.0.0"

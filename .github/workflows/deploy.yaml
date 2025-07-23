@@ -61,3 +61,60 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
   # Задача деплоя PR на сервер с Traefik
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      # Деплой PR на сервер
+      - name: Deploy PR to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USERNAME }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          script: |
+            docker login ${{ env.REGISTRY }} -u ${{ env.REGISTRY_USERNAME }} -p ${{ env.REGISTRY_PASSWORD }}
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            # Запуск нового контейнера с Traefik labels
+
+            NEW_NAME=${{ env.IMAGE_NAME }}-${{ github.ref_name }}-new
+            BASE_NAME=${{ env.IMAGE_NAME }}-${{ github.ref_name }}
+
+            docker run -d \
+              --name $NEW_NAME \
+              --restart unless-stopped \
+              --network proxy \
+              --label "traefik.enable=true" \
+              --label "traefik.http.routers.${{ env.IMAGE_NAME }}.rule=Host(\`preview-paromov.ru\`)" \
+              --label "traefik.http.routers.${{ env.IMAGE_NAME }}.entrypoints=websecure" \
+              --label "traefik.http.routers.${{ env.IMAGE_NAME }}.tls=true" \
+              --label "traefik.http.routers.${{ env.IMAGE_NAME }}.tls.certresolver=letsencrypt" \
+              --label "traefik.http.services.${{ env.IMAGE_NAME }}.loadbalancer.server.port=3000" \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+
+            # Ждём, пока контейнер станет healthy (до 60 секунд)
+            for i in {1..30}; do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' $NEW_NAME 2>/dev/null || echo "starting")
+              if [ "$STATUS" = "healthy" ]; then
+                echo "Контейнер $NEW_NAME healthy!"
+
+                docker stop $BASE_NAME || true
+                docker rm $BASE_NAME || true
+                docker rename $NEW_NAME $BASE_NAME || true
+                docker image prune -f || true
+
+                break
+              fi
+              if [ "$STATUS" = "unhealthy" ]; then
+                echo "Контейнер $NEW_NAME unhealthy!" >&2
+                docker logs $NEW_NAME >&2
+
+                docker stop $NEW_NAME || true
+                docker rm $NEW_NAME || true
+
+                exit 1
+              fi
+              echo "Ожидание healthcheck... ($i)"
+              sleep 2
+            done
