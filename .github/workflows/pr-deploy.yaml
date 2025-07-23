@@ -1,0 +1,142 @@
+name: PR Docker Deploy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+# Глобальные переменные окружения
+env:
+  REGISTRY_BASE: 1b856e48-humble-bittern.registry.twcstorage.ru
+  REGISTRY: 1b856e48-humble-bittern.registry.twcstorage.ru/next
+  REGISTRY_USERNAME: 1b856e48-humble-bittern
+  REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+  IMAGE_NAME: next
+  SSH_HOST: preview-paromov.ru
+  SSH_USERNAME: root
+  SSH_PRIVATE_KEY: ${{ secrets.SSH_SERVER_KEY }}
+  APP_NAME: next-pr-${{ github.event.pull_request.number }}
+jobs:
+  # Задача сборки и загрузки Docker образа для PR
+  build-and-push:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+
+    steps:
+      # Клонирование репозитория
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Common environment variables
+        run: |
+          echo "NEXT_PUBLIC_API_URL=/api" >> .env.local
+          echo "NEXT_PUBLIC_URL=http://${{ env.APP_NAME }}.preview-paromov.ru" >> .env.local
+          echo "API_URL=http://api.preview-paromov.ru" >> .env.local
+
+      # Настройка Docker Buildx для эффективной сборки
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Авторизация в Container Registry
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ env.REGISTRY_USERNAME }}
+          password: ${{ env.REGISTRY_PASSWORD }}
+
+      # Извлечение метаданных для тегирования образа
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      # Сборка и загрузка Docker образа
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+  # Задача деплоя PR на сервер с Traefik
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      # Деплой PR на сервер
+      - name: Deploy PR to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USERNAME }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          script: |
+            docker login ${{ env.REGISTRY }} -u ${{ env.REGISTRY_USERNAME }} -p ${{ env.REGISTRY_PASSWORD }}
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }}
+            # Запуск нового контейнера с Traefik labels
+
+            docker stop ${{ env.APP_NAME }} || true
+            docker rm ${{ env.APP_NAME }} || true
+            docker image prune -f || true
+
+            docker run -d \
+              --name ${{ env.APP_NAME }} \
+              --restart unless-stopped \
+              --network proxy \
+              --label "traefik.enable=true" \
+              --label "traefik.http.routers.${{ env.APP_NAME }}.rule=Host(\`${{ env.APP_NAME }}.preview-paromov.ru\`)" \
+              --label "traefik.http.routers.${{ env.APP_NAME }}.entrypoints=websecure" \
+              --label "traefik.http.routers.${{ env.APP_NAME }}.tls=true" \
+              --label "traefik.http.routers.${{ env.APP_NAME }}.tls.certresolver=letsencrypt" \
+              --label "traefik.http.services.${{ env.APP_NAME }}.loadbalancer.server.port=3000" \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }}
+
+      - name: Comment PR with deploy URL
+        if: github.event.action == 'opened'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `&#x1f680; PR deployed to: https://${{ env.APP_NAME }}.preview-paromov.ru`
+            })
+
+  cleanup:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup PR deployment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USERNAME }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          script: |
+            docker stop ${{ env.APP_NAME }} || true
+            docker rm ${{ env.APP_NAME }} || true
+            docker image prune -f || true
+
+      - name: Prepare regctl
+        run: |
+          curl -L https://github.com/regclient/regclient/releases/latest/download/regctl-linux-amd64 -o regctl
+          chmod +x regctl
+          ./regctl version
+          ./regctl registry login ${{ env.REGISTRY_BASE }} \
+            --user ${{ env.REGISTRY_USERNAME }} \
+            --pass ${{ env.REGISTRY_PASSWORD }}
+
+      - name: Cleanup old images
+        run: |
+          DIGEST=$(./regctl image digest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }}) || exit 0
+          ./regctl image remove $DIGEST
