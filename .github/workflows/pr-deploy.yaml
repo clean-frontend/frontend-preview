@@ -136,7 +136,8 @@ jobs:
             --user ${{ env.REGISTRY_USERNAME }} \
             --pass ${{ env.REGISTRY_PASSWORD }}
 
-      - name: Cleanup old images
-        run: |
-          DIGEST=$(./regctl image digest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }}) || exit 0
-          ./regctl image remove ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$DIGEST
+            - name: Cleanup old images
+            run: |
+              DIGEST=$(./regctl image digest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }}) || exit 0
+              ./regctl image rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST} || true
+              echo "Old image removed"
