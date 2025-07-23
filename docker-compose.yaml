@@ -1,0 +1,8 @@
+services:
+  next:
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_API_URL: /api
+        NEXT_PUBLIC_URL: http://preview-paromov.ru
+    image: 1b856e48-humble-bittern.registry.twcstorage.ru/next/next-image:0.0.2
